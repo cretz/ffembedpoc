@@ -10,18 +10,20 @@ import (
 )
 
 type remote struct {
+	firefox  *Firefox
 	rw       io.ReadWriteCloser
 	bufWrite *bufio.Writer
 	bufRead  *bufio.Reader
 	recvBuf  []byte
 }
 
-func dialRemote(addr string) (*remote, error) {
+func (f *Firefox) dialRemote(addr string) (*remote, error) {
 	conn, err := net.Dial("tcp", addr)
 	if err != nil {
 		return nil, err
 	}
 	return &remote{
+		firefox:  f,
 		rw:       conn,
 		bufWrite: bufio.NewWriter(conn),
 		bufRead:  bufio.NewReader(conn),
@@ -33,9 +35,14 @@ func dialRemote(addr string) (*remote, error) {
 func (r *remote) send(v map[string]interface{}) error {
 	// Write len, colon, then json
 	// TODO: Use buffer w/ encoder for better perf
-	if b, err := json.Marshal(v); err != nil {
+	b, err := json.Marshal(v)
+	if err != nil {
 		return fmt.Errorf("failed marshaling json: %w", err)
-	} else if _, err = r.bufWrite.WriteString(strconv.Itoa(len(b))); err != nil {
+	}
+	if r.firefox.config.LogRemoteMessages {
+		r.firefox.log.Debugf("Sending message: %s", b)
+	}
+	if _, err = r.bufWrite.WriteString(strconv.Itoa(len(b))); err != nil {
 		return err
 	} else if err = r.bufWrite.WriteByte(':'); err != nil {
 		return err
@@ -61,6 +68,9 @@ func (r *remote) recv() (map[string]interface{}, error) {
 	// Read the rest
 	if _, err := io.ReadFull(r.bufRead, r.recvBuf[:size]); err != nil {
 		return nil, err
+	}
+	if r.firefox.config.LogRemoteMessages {
+		r.firefox.log.Debugf("Received message: %s", r.recvBuf[:size])
 	}
 	// Unmarshal
 	var ret map[string]interface{}

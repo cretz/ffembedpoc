@@ -8,11 +8,19 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
-	"time"
+
+	"github.com/therecipe/qt/widgets"
+	"go.uber.org/zap"
 )
 
 type Firefox struct {
+	config Config
+	log    Logger
+	cmd    *exec.Cmd
+	pid    uint32
 	remote *remote
+
+	Widget *widgets.QWidget
 }
 
 type Config struct {
@@ -22,9 +30,20 @@ type Config struct {
 	DebugPort int
 	// Default is .profile in current dir
 	ProfilePath string
+	// Default is no parent
+	Parent widgets.QWidget_ITF
+	// Default is zap.S()
+	Log Logger
+	// Default is not to log remote messages (debug level)
+	LogRemoteMessages bool
 }
 
-// Context only for startup
+type Logger interface {
+	Debugf(string, ...interface{})
+	Infof(string, ...interface{})
+}
+
+// Context only for startup, should have timeout or could hang forever.
 func Start(ctx context.Context, config Config) (*Firefox, error) {
 	// Set default config values
 	var err error
@@ -39,76 +58,116 @@ func Start(ctx context.Context, config Config) (*Firefox, error) {
 	if config.ProfilePath == "" {
 		config.ProfilePath = ".profile"
 	}
+	if config.Log == nil {
+		config.Log = zap.S()
+	}
+	// Instantiate and close on any failure
+	f := &Firefox{config: config, log: config.Log}
+	success := false
+	defer func() {
+		if !success {
+			f.Close()
+		}
+	}()
 	// Make profile path absolute
 	if config.ProfilePath, err = filepath.Abs(config.ProfilePath); err != nil {
 		return nil, fmt.Errorf("failed making profile path absolute: %w", err)
 	}
 	// Create the profile
-	if err := getOrCreateFirefoxProfile(config.FirefoxPath, config.ProfilePath); err != nil {
+	if err := f.prepareProfile(); err != nil {
 		return nil, err
 	}
-	// Start firefox with the profile and remote port. Note, the command exits
-	// immediately because firefox starts up other processes.
-	// TODO: Accept port as config and check if remote already open first
+	// Start firefox with the profile and remote port. Sometimes Firefox starts
+	// another process and kills this one immediately, sometimes it leaves this
+	// one open depending on whether started from the console or UI.
 	debugPortStr := strconv.Itoa(config.DebugPort)
 	cmd := exec.CommandContext(ctx, config.FirefoxPath, "-profile", config.ProfilePath,
 		"-start-debugger-server", debugPortStr)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		return nil, fmt.Errorf("failed starting firefox: %w, output: %s", err, out)
+	// From console firefox starts another process, but not from UI directly
+	f.log.Debugf("Running %v", cmd)
+	if err := cmd.Start(); err != nil {
+		return nil, fmt.Errorf("failed starting firefox: %w", err)
 	}
-	// Get the window ID
-	if _, err = findFirefoxWindowID(ctx, config); err != nil {
+	// Set the PID and widget
+	if err = f.findAndSetPID(ctx); err != nil {
+		return nil, err
+	} else if err = f.findAndSetWidget(ctx); err != nil {
 		return nil, err
 	}
 	// Start remote
-	remote, err := dialRemote("127.0.0.1:" + debugPortStr)
-	if err != nil {
+	f.log.Debugf("Connecting to remote on 127.0.0.1:%v", debugPortStr)
+	if f.remote, err = f.dialRemote("127.0.0.1:" + debugPortStr); err != nil {
 		return nil, fmt.Errorf("failed connecting to remove: %w", err)
 	}
 	// Get the first message
-	msg, err := remote.recv()
-	if err != nil {
+	if _, err = f.remote.recv(); err != nil {
 		return nil, fmt.Errorf("failed receiving from remote: %w", err)
 	}
-	fmt.Printf("MESSAGE: %v - %#v\n", msg, msg)
-	// Send a message
-	if err := remote.send(map[string]interface{}{"to": "root", "type": "getRoot"}); err != nil {
-		return nil, fmt.Errorf("failed sending: %w", err)
-	}
-	// Get next message
-	msg, err = remote.recv()
-	if err != nil {
-		return nil, fmt.Errorf("failed receiving from remote: %w", err)
-	}
-	fmt.Printf("MESSAGE: %v - %#v\n", msg, msg)
-	time.Sleep(10 * time.Minute)
-	return nil, fmt.Errorf("TODO!!")
+	// TODO: Remote message handler
+	success = true
+	return f, nil
 }
 
 func (f *Firefox) Close() error {
-	// TODO: Kill
+	// Kill cmd if present, ignore error
+	if f.cmd != nil {
+		f.cmd.Process.Kill()
+	}
+	// Close remote if present, ignore error
+	if f.remote != nil {
+		f.remote.rw.Close()
+	}
+	// Kill PID
+	if f.pid != 0 {
+		if p, err := os.FindProcess(int(f.pid)); err != nil {
+			return fmt.Errorf("failed finding firefox process to close: %w", err)
+		} else if err = p.Kill(); err != nil {
+			return fmt.Errorf("failed killing firefox process: %w", err)
+		}
+	}
 	return nil
 }
 
 const defaultUserJS = `
-user_pref("devtools.chrome.enabled", true);
-user_pref("devtools.debugger.remote-enabled", true);
-user_pref("devtools.debugger.prompt-connection", false);
 user_pref("browser.shell.checkDefaultBrowser", false);
+user_pref("browser.tabs.drawInTitlebar", false);
+user_pref("devtools.chrome.enabled", true);
+user_pref("devtools.debugger.prompt-connection", false);
+user_pref("devtools.debugger.remote-enabled", true);
+user_pref("toolkit.legacyUserProfileCustomizations.stylesheets", true);
 `
 
-func getOrCreateFirefoxProfile(firefoxPath, profilePath string) error {
+const defaultUserChromeCSS = `
+@namespace url("http://www.mozilla.org/keymaster/gatekeeper/there.is.only.xul");
+
+#TabsToolbar {visibility: collapse;}
+#navigator-toolbox {visibility: collapse;}
+`
+
+func (f *Firefox) prepareProfile() error {
 	// Create the path if not there
-	if err := os.MkdirAll(profilePath, 0755); err != nil {
+	if err := os.MkdirAll(f.config.ProfilePath, 0755); err != nil {
 		return fmt.Errorf("failed creating profile path: %w", err)
 	}
 	// Create the user.js file if not there
-	userJSPath := filepath.Join(profilePath, "user.js")
+	userJSPath := filepath.Join(f.config.ProfilePath, "user.js")
 	if _, err := os.Stat(userJSPath); os.IsNotExist(err) {
+		f.log.Debugf("writing profile file %v", userJSPath)
 		if err := ioutil.WriteFile(userJSPath, []byte(defaultUserJS), 0644); err != nil {
 			return fmt.Errorf("failed writing user.js: %w", err)
 		}
 	}
+	// Create the userChrome.css if not there
+	userChromeCSSPath := filepath.Join(f.config.ProfilePath, "chrome", "userChrome.css")
+	if err := os.MkdirAll(filepath.Dir(userChromeCSSPath), 0755); err != nil {
+		return fmt.Errorf("failed creating chrome path: %w", err)
+	} else if _, err := os.Stat(userChromeCSSPath); os.IsNotExist(err) {
+		f.log.Debugf("writing profile file %v", userChromeCSSPath)
+		if err := ioutil.WriteFile(userChromeCSSPath, []byte(defaultUserChromeCSS), 0644); err != nil {
+			return fmt.Errorf("failed writing userChrome.css: %w", err)
+		}
+	}
+
 	// That's enough. We intentionally don't create the profile via -CreateProfile
 	// because Firefox would put it in the INI file. Rather, just giving the
 	// directory makes it be lazily created on first use.
