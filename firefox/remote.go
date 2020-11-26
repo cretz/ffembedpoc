@@ -7,14 +7,19 @@ import (
 	"io"
 	"net"
 	"strconv"
+	"sync"
 )
 
 type remote struct {
-	firefox  *Firefox
-	rw       io.ReadWriteCloser
+	firefox *Firefox
+	rw      io.ReadWriteCloser
+
 	bufWrite *bufio.Writer
+	sendLock sync.Mutex
+
 	bufRead  *bufio.Reader
 	recvBuf  []byte
+	recvLock sync.Mutex
 }
 
 func (f *Firefox) dialRemote(addr string) (*remote, error) {
@@ -32,10 +37,12 @@ func (f *Firefox) dialRemote(addr string) (*remote, error) {
 }
 
 // Should not be called concurrently
-func (r *remote) send(v map[string]interface{}) error {
+func (r *remote) send(jsonVal interface{}) error {
+	r.sendLock.Lock()
+	defer r.sendLock.Unlock()
 	// Write len, colon, then json
 	// TODO: Use buffer w/ encoder for better perf
-	b, err := json.Marshal(v)
+	b, err := json.Marshal(jsonVal)
 	if err != nil {
 		return fmt.Errorf("failed marshaling json: %w", err)
 	}
@@ -52,14 +59,16 @@ func (r *remote) send(v map[string]interface{}) error {
 	return r.bufWrite.Flush()
 }
 
-// Should not be called concurently
-func (r *remote) recv() (map[string]interface{}, error) {
+// Should not be called concurrently
+func (r *remote) recv(jsonVal interface{}) error {
+	r.recvLock.Lock()
+	defer r.recvLock.Unlock()
 	// Read until colon to get msg size
 	var size int
 	if sizeStr, err := r.bufRead.ReadString(':'); err != nil {
-		return nil, err
+		return err
 	} else if size, err = strconv.Atoi(string(sizeStr[:len(sizeStr)-1])); err != nil {
-		return nil, fmt.Errorf("invalid size string %s: %w", sizeStr[:len(sizeStr)-1], err)
+		return fmt.Errorf("invalid size string %s: %w", sizeStr[:len(sizeStr)-1], err)
 	}
 	// Make sure the read buf is big enough
 	if len(r.recvBuf) < size {
@@ -67,15 +76,14 @@ func (r *remote) recv() (map[string]interface{}, error) {
 	}
 	// Read the rest
 	if _, err := io.ReadFull(r.bufRead, r.recvBuf[:size]); err != nil {
-		return nil, err
+		return err
 	}
 	if r.firefox.config.LogRemoteMessages {
 		r.firefox.log.Debugf("Received message: %s", r.recvBuf[:size])
 	}
 	// Unmarshal
-	var ret map[string]interface{}
-	if err := json.Unmarshal(r.recvBuf[:size], &ret); err != nil {
-		return nil, fmt.Errorf("failed unmarshaling json: %w - original string: %s", err, r.recvBuf[:size])
+	if err := json.Unmarshal(r.recvBuf[:size], jsonVal); err != nil {
+		return fmt.Errorf("failed unmarshaling json: %w - original string: %s", err, r.recvBuf[:size])
 	}
-	return ret, nil
+	return nil
 }

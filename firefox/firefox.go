@@ -14,13 +14,17 @@ import (
 )
 
 type Firefox struct {
-	config Config
-	log    Logger
+	RootActor
+	Widget *widgets.QWidget
+
+	config    Config
+	log       Logger
+	runCtx    context.Context
+	runCancel context.CancelFunc
+
 	cmd    *exec.Cmd
 	pid    uint32
 	remote *remote
-
-	Widget *widgets.QWidget
 }
 
 type Config struct {
@@ -41,6 +45,7 @@ type Config struct {
 type Logger interface {
 	Debugf(string, ...interface{})
 	Infof(string, ...interface{})
+	Errorf(string, ...interface{})
 }
 
 // Context only for startup, should have timeout or could hang forever.
@@ -63,6 +68,7 @@ func Start(ctx context.Context, config Config) (*Firefox, error) {
 	}
 	// Instantiate and close on any failure
 	f := &Firefox{config: config, log: config.Log}
+	f.runCtx, f.runCancel = context.WithCancel(context.Background())
 	success := false
 	defer func() {
 		if !success {
@@ -99,16 +105,20 @@ func Start(ctx context.Context, config Config) (*Firefox, error) {
 	if f.remote, err = f.dialRemote("127.0.0.1:" + debugPortStr); err != nil {
 		return nil, fmt.Errorf("failed connecting to remove: %w", err)
 	}
-	// Get the first message
-	if _, err = f.remote.recv(); err != nil {
-		return nil, fmt.Errorf("failed receiving from remote: %w", err)
-	}
-	// TODO: Remote message handler
+	// Create actor manager, add root to it, and run it in background
+	f.mgr = f.newActorManager()
+	f.mgr.setActor("root", &f.RootActor)
+	go func() {
+		if err := f.mgr.run(); err != nil {
+			f.log.Errorf("Actor manager failed: %v", err)
+		}
+	}()
 	success = true
 	return f, nil
 }
 
 func (f *Firefox) Close() error {
+	f.runCancel()
 	// Kill cmd if present, ignore error
 	if f.cmd != nil {
 		f.cmd.Process.Kill()

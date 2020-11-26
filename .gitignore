@@ -1,3 +1,7 @@
 /.profile
-qtbox
-ffembedpoc*
+/deploy
+/ffembedpoc*
+/moc*
+/qtbox
+/vendor
+/windows
